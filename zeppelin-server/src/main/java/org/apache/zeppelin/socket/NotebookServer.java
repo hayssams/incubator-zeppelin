@@ -24,12 +24,17 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 
 import javax.servlet.http.HttpServletRequest;
 
+import org.apache.shiro.authz.permission.InvalidPermissionStringException;
+import org.apache.shiro.subject.PrincipalCollection;
+import org.apache.shiro.subject.SimplePrincipalCollection;
+import org.apache.shiro.subject.Subject;
+import org.apache.shiro.subject.support.SubjectThreadState;
+import org.apache.shiro.util.ThreadState;
 import org.apache.zeppelin.conf.ZeppelinConfiguration;
 import org.apache.zeppelin.conf.ZeppelinConfiguration.ConfVars;
 import org.apache.zeppelin.display.AngularObject;
 import org.apache.zeppelin.display.AngularObjectRegistry;
 import org.apache.zeppelin.display.AngularObjectRegistryListener;
-import org.apache.zeppelin.display.Input;
 import org.apache.zeppelin.interpreter.InterpreterOutput;
 import org.apache.zeppelin.interpreter.InterpreterResult;
 import org.apache.zeppelin.interpreter.InterpreterSetting;
@@ -37,7 +42,6 @@ import org.apache.zeppelin.interpreter.remote.RemoteInterpreterProcessListener;
 import org.apache.zeppelin.notebook.*;
 import org.apache.zeppelin.scheduler.Job;
 import org.apache.zeppelin.scheduler.Job.Status;
-import org.apache.zeppelin.scheduler.JobListener;
 import org.apache.zeppelin.server.ZeppelinServer;
 import org.apache.zeppelin.socket.Message.OP;
 import org.apache.zeppelin.ticket.TicketContainer;
@@ -91,9 +95,24 @@ public class NotebookServer extends WebSocketServlet implements
     connectedSockets.add(conn);
   }
 
+  /**
+   * Make principal passed through Websocket avaialble as a shiro subject for the current thread
+   * @param principal
+   * @return
+   */
+  private ThreadState bindSubject(String principal) {
+    String realmName = "myRealm";
+    PrincipalCollection principals = new SimplePrincipalCollection(principal, realmName);
+    Subject subject = new Subject.Builder().principals(principals).buildSubject();
+    ThreadState threadState = new SubjectThreadState(subject);
+    threadState.bind();
+    return threadState;
+  }
+
   @Override
   public void onMessage(NotebookSocket conn, String msg) {
     Notebook notebook = notebook();
+    ThreadState threadState = null;
     try {
       Message messagereceived = deserializeMessage(msg);
       LOG.debug("RECEIVE << " + messagereceived.op);
@@ -109,6 +128,9 @@ public class NotebookServer extends WebSocketServlet implements
       if (!allowAnonymous && messagereceived.principal.equals("anonymous")) {
         throw new Exception("Anonymous access not allowed ");
       }
+
+      /** Make subject available in the current thread */
+      threadState = bindSubject(messagereceived.principal);
 
       /** Lets be elegant here */
       switch (messagereceived.op) {
@@ -180,6 +202,11 @@ public class NotebookServer extends WebSocketServlet implements
       }
     } catch (Exception e) {
       LOG.error("Can't handle message", e);
+    } finally {
+      /** ensure any state is cleaned so the thread won't be
+          corrupt in a reusable or pooled thread environment */
+      if (threadState != null)
+        threadState.clear();
     }
   }
 
@@ -338,10 +365,11 @@ public class NotebookServer extends WebSocketServlet implements
       if (hideHomeScreenNotebookFromList && note.id().equals(homescreenNotebookId)) {
         continue;
       }
-
-      info.put("id", note.id());
-      info.put("name", note.getName());
-      notesInfo.add(info);
+      if (SecurityUtils.isPermitted(SecurityUtils.TYPE.NOTE, OP.GET_NOTE, note.id())) {
+        info.put("id", note.id());
+        info.put("name", note.getName());
+        notesInfo.add(info);
+      }
     }
 
     return notesInfo;
@@ -352,11 +380,17 @@ public class NotebookServer extends WebSocketServlet implements
   }
 
   public void broadcastNoteList() {
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTES, OP.LIST_NOTES);
+
     List<Map<String, String>> notesInfo = generateNotebooksInfo(false);
     broadcastAll(new Message(OP.NOTES_INFO).put("notes", notesInfo));
   }
 
   public void broadcastReloadedNoteList() {
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTES, OP.RELOAD_NOTES_FROM_REPO);
+
     List<Map<String, String>> notesInfo = generateNotebooksInfo(true);
     broadcastAll(new Message(OP.NOTES_INFO).put("notes", notesInfo));
   }
@@ -367,6 +401,8 @@ public class NotebookServer extends WebSocketServlet implements
     if (noteId == null) {
       return;
     }
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.GET_NOTE, noteId);
 
     Note note = notebook.getNote(noteId);
     if (note != null) {
@@ -383,6 +419,8 @@ public class NotebookServer extends WebSocketServlet implements
     if (noteId != null) {
       note = notebook.getNote(noteId);
     }
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTES, OP.GET_HOME_NOTE, "*");
 
     if (note != null) {
       addConnectionToNote(note.id(), conn);
@@ -406,6 +444,8 @@ public class NotebookServer extends WebSocketServlet implements
     if (config == null) {
       return;
     }
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.NOTE_UPDATE, noteId);
 
     Note note = notebook.getNote(noteId);
     if (note != null) {
@@ -438,6 +478,7 @@ public class NotebookServer extends WebSocketServlet implements
   }
   private void createNote(NotebookSocket conn, Notebook notebook, Message message)
       throws IOException {
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.NEW_NOTE);
     Note note = notebook.createNote();
     note.addParagraph(); // it's an empty note. so add one paragraph
     if (message != null) {
@@ -461,6 +502,8 @@ public class NotebookServer extends WebSocketServlet implements
       return;
     }
 
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.DEL_NOTE, noteId);
+
     Note note = notebook.getNote(noteId);
     notebook.removeNote(noteId);
     removeNote(noteId);
@@ -479,6 +522,9 @@ public class NotebookServer extends WebSocketServlet implements
     Map<String, Object> config = (Map<String, Object>) fromMessage
         .get("config");
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.COMMIT_PARAGRAPH, note.getId());
+
     Paragraph p = note.getParagraph(paragraphId);
     p.settings.setParams(params);
     p.setConfig(config);
@@ -491,6 +537,9 @@ public class NotebookServer extends WebSocketServlet implements
   private void cloneNote(NotebookSocket conn, Notebook notebook, Message fromMessage)
       throws IOException, CloneNotSupportedException {
     String noteId = getOpenNoteId(conn);
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.CLONE_NOTE, noteId);
+
     String name = (String) fromMessage.get("name");
     Note newNote = notebook.cloneNote(noteId, name);
     addConnectionToNote(newNote.id(), (NotebookSocket) conn);
@@ -500,6 +549,9 @@ public class NotebookServer extends WebSocketServlet implements
 
   protected Note importNote(NotebookSocket conn, Notebook notebook, Message fromMessage)
       throws IOException {
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTES, OP.IMPORT_NOTE);
+
     Note note = null;
     if (fromMessage != null) {
       String noteName = (String) ((Map) fromMessage.get("notebook")).get("name");
@@ -520,6 +572,9 @@ public class NotebookServer extends WebSocketServlet implements
     }
 
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.PARAGRAPH_REMOVE, note.getId());
+
     /** We dont want to remove the last paragraph */
     if (!note.isLastParagraph(paragraphId)) {
       note.removeParagraph(paragraphId);
@@ -536,6 +591,9 @@ public class NotebookServer extends WebSocketServlet implements
     }
 
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.PARAGRAPH_CLEAR_OUTPUT, note.getId());
+
     note.clearParagraphOutput(paragraphId);
     broadcastNote(note);
   }
@@ -552,6 +610,10 @@ public class NotebookServer extends WebSocketServlet implements
     }
 
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    /** this one is probably not useful */
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.COMPLETION, note.getId());
+
     List<String> candidates = note.completion(paragraphId, buffer, cursor);
     resp.put("completions", candidates);
     conn.send(serializeMessage(resp));
@@ -657,6 +719,9 @@ public class NotebookServer extends WebSocketServlet implements
     final int newIndex = (int) Double.parseDouble(fromMessage.get("index")
         .toString());
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.MOVE_PARAGRAPH, note.getId());
+
     note.moveParagraph(paragraphId, newIndex);
     note.persist();
     broadcastNote(note);
@@ -667,6 +732,9 @@ public class NotebookServer extends WebSocketServlet implements
     final int index = (int) Double.parseDouble(fromMessage.get("index")
             .toString());
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.INSERT_PARAGRAPH, note.getId());
+
     note.insertParagraph(index);
     note.persist();
     broadcastNote(note);
@@ -680,6 +748,9 @@ public class NotebookServer extends WebSocketServlet implements
     }
 
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.CANCEL_PARAGRAPH, note.getId());
+
     Paragraph p = note.getParagraph(paragraphId);
     p.abort();
   }
@@ -692,6 +763,9 @@ public class NotebookServer extends WebSocketServlet implements
     }
 
     final Note note = notebook.getNote(getOpenNoteId(conn));
+
+    SecurityUtils.checkPermission(SecurityUtils.TYPE.NOTE, OP.RUN_PARAGRAPH, note.getId());
+
     Paragraph p = note.getParagraph(paragraphId);
     String text = (String) fromMessage.get("paragraph");
     p.setText(text);
