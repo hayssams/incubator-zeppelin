@@ -16,8 +16,10 @@
  */
 package org.apache.zeppelin.utils;
 
+import org.apache.shiro.authz.UnauthorizedException;
 import org.apache.shiro.subject.Subject;
 import org.apache.zeppelin.conf.ZeppelinConfiguration;
+import org.apache.zeppelin.socket.Message;
 
 import java.net.InetAddress;
 import java.net.URI;
@@ -60,5 +62,40 @@ public class SecurityUtils {
       principal = "anonymous";
     }
     return principal;
+  }
+
+  /**
+   * Permision object types
+   */
+  public enum TYPE {
+    INTERPERTERS,
+    INTERPRETER,
+    NOTES,
+    NOTE
+  }
+
+  /**
+   * Check operation is allowed on this object instanc eofr the current subject
+   * @param cls : Object Type
+   * @param op : Operation
+   * @param instance : the object being accessed
+   */
+  public static void checkPermission(TYPE cls, Message.OP op, String instance) {
+    if (!isPermitted(cls, op, instance)) {
+      throw new UnauthorizedException("");
+    }
+  }
+
+  public static void checkPermission(TYPE cls, Message.OP op) {
+    checkPermission(cls, op, "*");
+  }
+
+  public static boolean isPermitted(TYPE cls, Message.OP op, String instance) {
+    Subject currentUser = org.apache.shiro.SecurityUtils.getSubject();
+    return currentUser.isPermitted(String.format("%s:%s:%s", cls.toString(), op.toString(), instance));
+  }
+
+  public static boolean isPermitted(TYPE cls, Message.OP op) {
+    return isPermitted(cls, op, "*");
   }
 }
